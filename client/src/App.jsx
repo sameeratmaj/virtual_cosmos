@@ -1,18 +1,27 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import VirtualCosmos from "./components/VirtualCosmos";
 import { socket } from "./lib/socket";
+import { getDistance } from "./utils/distance";
 
 const INITIAL_PLAYER = {
   socketId: null,
   userId: "loading",
-  x: 320,
-  y: 240,
+  x: 2500,
+  y: 2500,
+};
+const CHAT_STATUS = {
+  IDLE: "IDLE",
+  PENDING_SENT: "PENDING_SENT",
+  PENDING_RECEIVED: "PENDING_RECEIVED",
+  CONNECTED: "CONNECTED",
 };
 
 export default function App() {
   const [localPlayer, setLocalPlayer] = useState(INITIAL_PLAYER);
   const [remotePlayers, setRemotePlayers] = useState({});
   const [activeChatPartner, setActiveChatPartner] = useState(null);
+  const [chatStatus, setChatStatus] = useState(CHAT_STATUS.IDLE);
+  const [activeRoomId, setActiveRoomId] = useState(null);
   const [draftMessage, setDraftMessage] = useState("");
   const [chatMessages, setChatMessages] = useState({});
   const [chatError, setChatError] = useState("");
@@ -22,60 +31,153 @@ export default function App() {
     userId: null,
     lastError: "",
   });
+  const remotePlayersRef = useRef(remotePlayers);
 
-  const remoteCount = useMemo(() => Object.keys(remotePlayers).length, [remotePlayers]);
-  const activeConversationId = useMemo(() => {
-    if (!activeChatPartner?.userId || !localPlayer.userId || localPlayer.userId === "loading") {
-      return null;
-    }
+  useEffect(() => {
+    remotePlayersRef.current = remotePlayers;
+  }, [remotePlayers]);
 
-    return [localPlayer.userId, activeChatPartner.userId].sort().join("__");
-  }, [activeChatPartner, localPlayer.userId]);
-
-  const activeMessages = activeConversationId ? chatMessages[activeConversationId] ?? [] : [];
+  const remoteCount = Object.keys(remotePlayers).length;
+  const activeMessages = activeRoomId ? chatMessages[activeRoomId] ?? [] : [];
 
   useEffect(() => {
     const handleChatMessage = (message) => {
       setChatMessages((currentMessages) => {
-        const conversationMessages = currentMessages[message.conversationId] ?? [];
+        const conversationMessages = currentMessages[message.roomId] ?? [];
 
         return {
           ...currentMessages,
-          [message.conversationId]: [...conversationMessages, message],
+          [message.roomId]: [...conversationMessages, message],
         };
       });
       setChatError("");
     };
 
+    const handleRequestPending = ({ partner, chatStatus: nextStatus }) => {
+      setActiveChatPartner(partner);
+      setChatStatus(nextStatus);
+      setActiveRoomId(null);
+      setDraftMessage("");
+      setChatError("");
+    };
+
+    const handleRequestReceived = ({ partner, chatStatus: nextStatus }) => {
+      setActiveChatPartner(partner);
+      setChatStatus(nextStatus);
+      setActiveRoomId(null);
+      setDraftMessage("");
+      setChatError("");
+    };
+
+    const handleChatConnected = ({ partner, roomId, chatStatus: nextStatus }) => {
+      setActiveChatPartner(partner);
+      setActiveRoomId(roomId);
+      setChatStatus(nextStatus);
+      setChatError("");
+    };
+
+    const handleBreakConnection = ({ reason }) => {
+      setChatStatus(CHAT_STATUS.IDLE);
+      setActiveChatPartner(null);
+      setActiveRoomId(null);
+      setDraftMessage("");
+      setChatError(reason ?? "");
+    };
+
+    const handleSocketDisconnect = () => {
+      setChatStatus(CHAT_STATUS.IDLE);
+      setActiveChatPartner(null);
+      setActiveRoomId(null);
+      setDraftMessage("");
+    };
+
     const handleChatError = ({ message }) => {
+      setChatStatus(CHAT_STATUS.IDLE);
+      setActiveChatPartner(null);
+      setActiveRoomId(null);
       setChatError(message);
     };
 
     socket.on("chat_message", handleChatMessage);
+    socket.on("chat_request_pending", handleRequestPending);
+    socket.on("chat_request_received", handleRequestReceived);
+    socket.on("chat_connected", handleChatConnected);
+    socket.on("break_connection", handleBreakConnection);
+    socket.on("disconnect", handleSocketDisconnect);
     socket.on("chat_error", handleChatError);
 
     return () => {
       socket.off("chat_message", handleChatMessage);
+      socket.off("chat_request_pending", handleRequestPending);
+      socket.off("chat_request_received", handleRequestReceived);
+      socket.off("chat_connected", handleChatConnected);
+      socket.off("break_connection", handleBreakConnection);
+      socket.off("disconnect", handleSocketDisconnect);
       socket.off("chat_error", handleChatError);
     };
   }, []);
 
   useEffect(() => {
-    if (!activeChatPartner) {
+    if (chatStatus !== CHAT_STATUS.CONNECTED) {
       setDraftMessage("");
-      setChatError("");
     }
-  }, [activeChatPartner]);
+  }, [chatStatus]);
+
+  const handleAvatarClick = (targetUserId) => {
+    if (chatStatus !== CHAT_STATUS.IDLE) {
+      return;
+    }
+
+    const targetPlayer = Object.values(remotePlayersRef.current).find(
+      (player) => player.userId === targetUserId
+    );
+
+    if (!targetPlayer) {
+      setChatError("That player is no longer available.");
+      return;
+    }
+
+    if (getDistance(localPlayer, targetPlayer) >= 150) {
+      setChatError("Move within 150px before sending a chat request.");
+      return;
+    }
+
+    setActiveChatPartner(targetPlayer);
+    setChatStatus(CHAT_STATUS.PENDING_SENT);
+    setActiveRoomId(null);
+    setChatError("");
+    socket.emit("chat_request_sent", { toUserId: targetUserId });
+  };
+
+  const handleAcceptChatRequest = () => {
+    if (chatStatus !== CHAT_STATUS.PENDING_RECEIVED || !activeChatPartner?.userId) {
+      return;
+    }
+
+    socket.emit("chat_request_accepted", {
+      fromUserId: activeChatPartner.userId,
+    });
+  };
+
+  const handleDeclineChatRequest = () => {
+    if (chatStatus !== CHAT_STATUS.PENDING_RECEIVED || !activeChatPartner?.userId) {
+      return;
+    }
+
+    socket.emit("chat_request_declined", {
+      fromUserId: activeChatPartner.userId,
+    });
+  };
 
   const handleSendMessage = () => {
     const message = draftMessage.trim();
 
-    if (!activeChatPartner?.socketId || !message) {
+    if (chatStatus !== CHAT_STATUS.CONNECTED || !activeRoomId || !message) {
       return;
     }
 
     socket.emit("send_chat_message", {
-      toSocketId: activeChatPartner.socketId,
+      roomId: activeRoomId,
       message,
     });
 
@@ -90,68 +192,39 @@ export default function App() {
   };
 
   return (
-    <main className="min-h-screen px-4 py-6 text-slate-100 md:px-8">
-      <div className="mx-auto flex max-w-7xl flex-col gap-6">
-        <header className="rounded-3xl border border-sky-400/20 bg-slate-950/60 p-6 backdrop-blur">
-          <p className="text-sm uppercase tracking-[0.3em] text-sky-300/80">
-            Virtual Cosmos
-          </p>
-          <h1 className="mt-2 text-4xl font-semibold text-white">
-            Proximity-based multiplayer space
-          </h1>
-          <div className="mt-4 flex flex-wrap gap-3 text-sm text-slate-300">
-            <span className="rounded-full border border-slate-700 px-3 py-1">
-              You: {localPlayer.userId}
-            </span>
-            <span className="rounded-full border border-slate-700 px-3 py-1">
-              Remote players: {remoteCount}
-            </span>
-            <span className="rounded-full border border-slate-700 px-3 py-1">
-              Controls: WASD / Arrow Keys
-            </span>
-            <span className="rounded-full border border-slate-700 px-3 py-1">
-              Socket: {connectionState.connected ? "connected" : "disconnected"}
-            </span>
-            <span className="rounded-full border border-slate-700 px-3 py-1">
-              Socket ID: {connectionState.socketId ?? "pending"}
-            </span>
-          </div>
-          {connectionState.lastError ? (
-            <p className="mt-3 text-sm text-rose-300">
-              Socket error: {connectionState.lastError}
-            </p>
-          ) : null}
-        </header>
+    <main className="h-screen w-screen overflow-hidden bg-slate-950 text-slate-100">
+      
+        
 
-        <section className="relative">
+        <section className="relative h-full w-full">
           <VirtualCosmos
             localPlayer={localPlayer}
             setLocalPlayer={setLocalPlayer}
             remotePlayers={remotePlayers}
             setRemotePlayers={setRemotePlayers}
-            setActiveChatPartner={setActiveChatPartner}
             setConnectionState={setConnectionState}
+            chatStatus={chatStatus}
+            onAvatarClick={handleAvatarClick}
           />
 
-          {activeChatPartner ? (
+          {chatStatus === CHAT_STATUS.CONNECTED && activeChatPartner ? (
             <aside className="absolute right-4 top-4 w-full max-w-sm rounded-2xl border border-emerald-400/30 bg-slate-950/95 p-4 shadow-xl shadow-emerald-950/40 backdrop-blur">
               <div className="flex items-start justify-between gap-4">
                 <div>
                   <p className="text-xs uppercase tracking-[0.25em] text-emerald-300">
-                    PROXIMITY_CONNECTED
+                    CONNECTED
                   </p>
                   <h2 className="mt-1 text-lg font-semibold text-white">
                     Chat with {activeChatPartner.userId}
                   </h2>
                   <p className="mt-1 text-sm text-slate-400">
-                    This panel stays visible while the player is within 150px.
+                    Messages stay active only while both players remain within 150px.
                   </p>
                 </div>
               </div>
 
               <div className="mt-4 rounded-2xl border border-slate-800 bg-slate-900/90 p-3 text-sm text-slate-400">
-                Messages in this room are delivered only while both players stay
-                within the 150px proximity radius.
+                This private room was created after both players agreed to chat.
               </div>
 
               <div className="mt-4 h-52 space-y-3 overflow-y-auto rounded-2xl border border-slate-800 bg-slate-900/90 p-3">
@@ -200,24 +273,73 @@ export default function App() {
                   type="button"
                   onClick={handleSendMessage}
                   className="rounded-full bg-emerald-400 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-emerald-300 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
-                  disabled={!draftMessage.trim()}
+                  disabled={chatStatus !== CHAT_STATUS.CONNECTED || !draftMessage.trim()}
                 >
                   Send
                 </button>
               </div>
             </aside>
+          ) : chatStatus === CHAT_STATUS.PENDING_RECEIVED && activeChatPartner ? (
+            <aside className="absolute right-4 top-4 w-full max-w-sm rounded-2xl border border-amber-400/30 bg-slate-950/95 p-4 shadow-xl shadow-amber-950/40 backdrop-blur">
+              <p className="text-xs uppercase tracking-[0.25em] text-amber-300">
+                PENDING_RECEIVED
+              </p>
+              <h2 className="mt-2 text-lg font-semibold text-white">
+                {activeChatPartner.userId} wants to chat
+              </h2>
+              <p className="mt-2 text-sm text-slate-400">
+                Accept to create a temporary room. This request will break if either player moves out of the 150px range.
+              </p>
+              <div className="mt-4 flex gap-3">
+                <button
+                  type="button"
+                  onClick={handleAcceptChatRequest}
+                  className="rounded-full bg-emerald-400 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-emerald-300"
+                >
+                  Accept
+                </button>
+                <button
+                  type="button"
+                  onClick={handleDeclineChatRequest}
+                  className="rounded-full border border-slate-700 px-4 py-2 text-sm font-medium text-slate-200 transition hover:border-slate-500 hover:text-white"
+                >
+                  Decline
+                </button>
+              </div>
+              {chatError ? (
+                <p className="mt-3 text-sm text-rose-300">{chatError}</p>
+              ) : null}
+            </aside>
+          ) : chatStatus === CHAT_STATUS.PENDING_SENT && activeChatPartner ? (
+            <aside className="absolute right-4 top-4 max-w-sm rounded-2xl border border-sky-400/30 bg-slate-950/90 p-4 text-sm text-slate-300 backdrop-blur">
+              <p className="text-xs uppercase tracking-[0.25em] text-sky-300">
+                PENDING_SENT
+              </p>
+              <h2 className="mt-2 text-lg font-semibold text-white">
+                Waiting for {activeChatPartner.userId}
+              </h2>
+              <p className="mt-2 text-slate-400">
+                Your chat request is pending. Stay within 150px until they accept.
+              </p>
+              {chatError ? (
+                <p className="mt-3 text-sm text-rose-300">{chatError}</p>
+              ) : null}
+            </aside>
           ) : (
             <aside className="absolute right-4 top-4 max-w-sm rounded-2xl border border-slate-700/60 bg-slate-950/85 p-4 text-sm text-slate-400 backdrop-blur">
               <p className="text-xs uppercase tracking-[0.25em] text-slate-500">
-                PROXIMITY_DISCONNECTED
+                IDLE
               </p>
               <p className="mt-2">
-                Move within 150px of another player to auto-open the chat room.
+                Move within 150px of another player, then click their avatar to request permission to chat.
               </p>
+              {chatError ? (
+                <p className="mt-3 text-sm text-rose-300">{chatError}</p>
+              ) : null}
             </aside>
           )}
         </section>
-      </div>
+      
     </main>
   );
 }
